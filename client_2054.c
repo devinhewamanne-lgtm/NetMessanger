@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -7,9 +8,21 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define PORT 8054
+/* =========================================================
+   PERSONALIZATION
+   ========================================================= */
+
+#define REGISTRATION_NUMBER "IT23752054"
+#define SERVER_PORT 8054
+#define NID_TAG "NID:7520"
+
 #define BUFFER_SIZE 4096
 #define MAX_USERNAME 32
+
+
+/* =========================================================
+   GLOBAL STATE
+   ========================================================= */
 
 volatile int running = 1;
 
@@ -21,7 +34,17 @@ volatile int running = 1;
 typedef struct
 {
     int socket_fd;
+
+    /*
+     * TCP receive buffer.
+     *
+     * Since TCP is a byte stream, one recv() may contain:
+     * - a partial line
+     * - one complete line
+     * - multiple complete lines
+     */
     char buffer[BUFFER_SIZE];
+
     size_t buffer_len;
 
 } ReceiverContext;
@@ -29,10 +52,11 @@ typedef struct
 
 /* =========================================================
    SEND ALL
-   Ensures the complete message is sent.
    ========================================================= */
 
-int send_all(int socket_fd, const char *data, size_t length)
+int send_all(int socket_fd,
+             const char *data,
+             size_t length)
 {
     size_t total_sent = 0;
 
@@ -44,7 +68,17 @@ int send_all(int socket_fd, const char *data, size_t length)
                  length - total_sent,
                  0);
 
-        if (sent <= 0)
+        if (sent < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (sent == 0)
         {
             return -1;
         }
@@ -58,16 +92,16 @@ int send_all(int socket_fd, const char *data, size_t length)
 
 /* =========================================================
    RECEIVE ONE COMPLETE LINE
-   Used during the initial REGISTER response.
+   Used for the REGISTER response.
    ========================================================= */
 
 int receive_line_blocking(int socket_fd,
                           char *buffer,
                           size_t buffer_size)
 {
-    size_t received_total = 0;
+    size_t total_received = 0;
 
-    while (received_total < buffer_size - 1)
+    while (total_received < buffer_size - 1)
     {
         char ch;
 
@@ -84,14 +118,21 @@ int receive_line_blocking(int socket_fd,
 
         if (received < 0)
         {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
             return -1;
         }
 
-        buffer[received_total++] = ch;
+        buffer[total_received] = ch;
+        total_received++;
 
         if (ch == '\n')
         {
-            buffer[received_total] = '\0';
+            buffer[total_received] = '\0';
+
             return 1;
         }
     }
@@ -103,15 +144,28 @@ int receive_line_blocking(int socket_fd,
 
 
 /* =========================================================
-   RECEIVE THREAD
-   Correctly handles:
-   - partial lines
-   - multiple lines in one recv()
+   DISPLAY RECEIVED SERVER MESSAGE
+   ========================================================= */
+
+void display_server_line(const char *line)
+{
+    printf("\n%s", line);
+
+    if (running)
+    {
+        printf("> ");
+        fflush(stdout);
+    }
+}
+
+
+/* =========================================================
+   RECEIVER THREAD
    ========================================================= */
 
 void *receive_messages(void *arg)
 {
-    ReceiverContext *ctx =
+    ReceiverContext *context =
         (ReceiverContext *)arg;
 
     char line[BUFFER_SIZE];
@@ -119,13 +173,15 @@ void *receive_messages(void *arg)
     while (running)
     {
         /*
-         * Search for a complete line already in the buffer.
+         * Look for a complete line in the buffer.
          */
         size_t newline_pos = (size_t)-1;
 
-        for (size_t i = 0; i < ctx->buffer_len; i++)
+        for (size_t i = 0;
+             i < context->buffer_len;
+             i++)
         {
-            if (ctx->buffer[i] == '\n')
+            if (context->buffer[i] == '\n')
             {
                 newline_pos = i;
                 break;
@@ -133,7 +189,7 @@ void *receive_messages(void *arg)
         }
 
         /*
-         * A complete line is available.
+         * Complete line found.
          */
         if (newline_pos != (size_t)-1)
         {
@@ -149,7 +205,7 @@ void *receive_messages(void *arg)
             }
 
             memcpy(line,
-                   ctx->buffer,
+                   context->buffer,
                    line_length);
 
             line[line_length] = '\0';
@@ -158,28 +214,26 @@ void *receive_messages(void *arg)
              * Remove the processed line.
              */
             size_t remaining =
-                ctx->buffer_len - line_length;
+                context->buffer_len - line_length;
 
-            memmove(ctx->buffer,
-                    ctx->buffer + line_length,
+            memmove(context->buffer,
+                    context->buffer + line_length,
                     remaining);
 
-            ctx->buffer_len = remaining;
+            context->buffer_len = remaining;
 
-            printf("\n%s", line);
-
-            printf("> ");
-            fflush(stdout);
+            display_server_line(line);
 
             continue;
         }
 
         /*
-         * Buffer is full but there is no newline.
+         * Protect receive buffer from overflow.
          */
-        if (ctx->buffer_len >= sizeof(ctx->buffer) - 1)
+        if (context->buffer_len >=
+            sizeof(context->buffer) - 1)
         {
-            printf("\n[CLIENT] Input buffer full.\n");
+            printf("\n[CLIENT] Receive buffer full.\n");
 
             running = 0;
             break;
@@ -189,12 +243,15 @@ void *receive_messages(void *arg)
          * Receive more TCP data.
          */
         ssize_t received =
-            recv(ctx->socket_fd,
-                 ctx->buffer + ctx->buffer_len,
-                 sizeof(ctx->buffer) -
-                     ctx->buffer_len - 1,
+            recv(context->socket_fd,
+                 context->buffer + context->buffer_len,
+                 sizeof(context->buffer) -
+                     context->buffer_len - 1,
                  0);
 
+        /*
+         * Server disconnected.
+         */
         if (received == 0)
         {
             printf("\n[CLIENT] Server disconnected.\n");
@@ -203,8 +260,16 @@ void *receive_messages(void *arg)
             break;
         }
 
+        /*
+         * Receive error.
+         */
         if (received < 0)
         {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
             if (running)
             {
                 perror("[CLIENT] recv");
@@ -214,13 +279,32 @@ void *receive_messages(void *arg)
             break;
         }
 
-        ctx->buffer_len +=
+        context->buffer_len +=
             (size_t)received;
 
-        ctx->buffer[ctx->buffer_len] = '\0';
+        context->buffer[context->buffer_len] = '\0';
     }
 
     return NULL;
+}
+
+
+/* =========================================================
+   DISPLAY COMMANDS
+   ========================================================= */
+
+void print_commands(void)
+{
+    printf("\nAvailable commands:\n");
+    printf("LIST\n");
+    printf("BCAST <message>\n");
+    printf("PMSG <username> <message>\n");
+    printf("JOIN <room>\n");
+    printf("LEAVE <room>\n");
+    printf("ROOMS\n");
+    printf("RMSG <room> <message>\n");
+    printf("QUIT\n");
+    printf("\n");
 }
 
 
@@ -235,6 +319,11 @@ int main(int argc, char *argv[])
     struct sockaddr_in server_addr;
 
     const char *server_ip = "127.0.0.1";
+
+
+    /* =====================================================
+       OPTIONAL SERVER IP
+       ===================================================== */
 
     if (argc >= 2)
     {
@@ -259,6 +348,10 @@ int main(int argc, char *argv[])
     }
 
 
+    /* =====================================================
+       SERVER ADDRESS
+       ===================================================== */
+
     memset(&server_addr,
            0,
            sizeof(server_addr));
@@ -267,7 +360,7 @@ int main(int argc, char *argv[])
         AF_INET;
 
     server_addr.sin_port =
-        htons(PORT);
+        htons(SERVER_PORT);
 
 
     if (inet_pton(AF_INET,
@@ -278,12 +371,12 @@ int main(int argc, char *argv[])
 
         close(sockfd);
 
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
 
     /* =====================================================
-       CONNECT TO SERVER
+       CONNECT
        ===================================================== */
 
     if (connect(sockfd,
@@ -294,22 +387,30 @@ int main(int argc, char *argv[])
 
         close(sockfd);
 
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
+
+    /* =====================================================
+       CLIENT INFORMATION
+       ===================================================== */
 
     printf("========================================\n");
     printf("       NetMessenger Client\n");
     printf("========================================\n");
-    printf("Registration : IT23752054\n");
-    printf("Server IP    : %s\n", server_ip);
-    printf("Port         : 8054\n");
-    printf("NID          : NID:7520\n");
+    printf("Registration : %s\n",
+           REGISTRATION_NUMBER);
+    printf("Server IP    : %s\n",
+           server_ip);
+    printf("Port         : %d\n",
+           SERVER_PORT);
+    printf("NID          : %s\n",
+           NID_TAG);
     printf("========================================\n");
 
 
     /* =====================================================
-       USERNAME
+       GET USERNAME
        ===================================================== */
 
     char username[MAX_USERNAME];
@@ -341,22 +442,21 @@ int main(int argc, char *argv[])
 
 
     /* =====================================================
-       REGISTER
+       CREATE REGISTER COMMAND
        ===================================================== */
 
     char register_command[BUFFER_SIZE];
 
-    snprintf(register_command,
-             sizeof(register_command),
-             "REGISTER %s\n",
-             username);
+    int written =
+        snprintf(register_command,
+                 sizeof(register_command),
+                 "REGISTER %s\n",
+                 username);
 
-
-    if (send_all(sockfd,
-                 register_command,
-                 strlen(register_command)) < 0)
+    if (written < 0 ||
+        (size_t)written >= sizeof(register_command))
     {
-        perror("send");
+        printf("Username is too long.\n");
 
         close(sockfd);
 
@@ -365,7 +465,23 @@ int main(int argc, char *argv[])
 
 
     /* =====================================================
-       RECEIVE REGISTRATION RESPONSE
+       SEND REGISTER
+       ===================================================== */
+
+    if (send_all(sockfd,
+                 register_command,
+                 strlen(register_command)) < 0)
+    {
+        perror("[CLIENT] send");
+
+        close(sockfd);
+
+        return 0;
+    }
+
+
+    /* =====================================================
+       RECEIVE REGISTER RESPONSE
        ===================================================== */
 
     char response[BUFFER_SIZE];
@@ -384,9 +500,18 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    if (response_result < 0)
+    if (response_result == -1)
     {
-        printf("Failed to receive registration response.\n");
+        perror("[CLIENT] recv");
+
+        close(sockfd);
+
+        return 0;
+    }
+
+    if (response_result == -2)
+    {
+        printf("Registration response too long.\n");
 
         close(sockfd);
 
@@ -397,13 +522,17 @@ int main(int argc, char *argv[])
 
 
     /* =====================================================
-       REGISTRATION FAILURE
+       CHECK REGISTRATION RESULT
        ===================================================== */
 
     if (strncmp(response,
                 "OK REGISTERED",
                 13) != 0)
     {
+        /*
+         * Example:
+         * ERR 001 USERNAME_TAKEN NID:7520
+         */
         close(sockfd);
 
         return 0;
@@ -411,7 +540,7 @@ int main(int argc, char *argv[])
 
 
     /* =====================================================
-       CREATE RECEIVER CONTEXT
+       RECEIVER CONTEXT
        ===================================================== */
 
     ReceiverContext receiver_context;
@@ -420,8 +549,7 @@ int main(int argc, char *argv[])
            0,
            sizeof(receiver_context));
 
-    receiver_context.socket_fd =
-        sockfd;
+    receiver_context.socket_fd = sockfd;
 
 
     /* =====================================================
@@ -435,27 +563,23 @@ int main(int argc, char *argv[])
                        receive_messages,
                        &receiver_context) != 0)
     {
-        perror("pthread_create");
+        perror("[CLIENT] pthread_create");
 
         close(sockfd);
 
         return 0;
     }
 
-	printf("\nAvailable commands:\n");
-printf("LIST\n");
-printf("BCAST <message>\n");
-printf("PMSG <username> <message>\n");
-printf("JOIN <room>\n");
-printf("LEAVE <room>\n");
-printf("ROOMS\n");
-printf("QUIT\n");
-printf("\n");
 
+    /* =====================================================
+       DISPLAY COMMANDS
+       ===================================================== */
+
+    print_commands();
 
 
     /* =====================================================
-       COMMAND LOOP
+       MAIN COMMAND LOOP
        ===================================================== */
 
     char command[BUFFER_SIZE];
@@ -472,19 +596,44 @@ printf("\n");
             break;
         }
 
+
+        /*
+         * Ignore empty input.
+         */
+        if (strcmp(command, "\n") == 0 ||
+            strcmp(command, "\r\n") == 0)
+        {
+            continue;
+        }
+
+
+        /*
+         * Send command to server.
+         */
         if (send_all(sockfd,
                      command,
                      strlen(command)) < 0)
         {
-            perror("send");
+            perror("[CLIENT] send");
 
+            running = 0;
             break;
         }
 
+
+        /*
+         * QUIT:
+         * The server should still send:
+         *
+         * OK BYE NID:7520
+         */
         if (strncmp(command,
                     "QUIT",
                     4) == 0)
         {
+            shutdown(sockfd,
+                     SHUT_WR);
+
             break;
         }
     }
@@ -494,15 +643,26 @@ printf("\n");
        SHUTDOWN
        ===================================================== */
 
-    running = 0;
+    if (running)
+    {
+        shutdown(sockfd,
+                 SHUT_WR);
+    }
+
+    pthread_join(receiver_thread,
+                 NULL);
+
+
+    /* =====================================================
+       CLOSE SOCKET
+       ===================================================== */
 
     shutdown(sockfd,
              SHUT_RDWR);
 
     close(sockfd);
 
-    pthread_join(receiver_thread,
-                 NULL);
+    running = 0;
 
     printf("\nClient closed.\n");
 
