@@ -1,0 +1,20 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -pedantic -pthread
+
+SERVER = server_2054
+CLIENT = client_2054
+
+all: $(SERVER) $(CLIENT)
+
+$(SERVER): server_2054.c
+	$(CC) $(CFLAGS) server_2054.c -o $(SERVER)
+
+$(CLIENT): client_2054.c
+	$(CC) $(CFLAGS) client_2054.c -o $(CLIENT)
+
+clean:
+	rm -f $(SERVER) $(CLIENT)
+
+rebuild: clean all
+
+.PHONY: all clean rebuild
