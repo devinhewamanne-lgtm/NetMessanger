@@ -18,3 +18,9 @@
 [2026-10-07 11:14:55] Broadcast from Devin: Hello Ransika
 [2026-10-07 11:17:13] Broadcast from Ransika: Hello Devin!
 [2026-10-07 11:19:09] User disconnected: Devin
+[2026-10-07 13:05:05] User registered: Devin
+[2026-10-07 13:05:31] User registered: Ransika
+[2026-10-07 13:06:05] Private message: Devin -> Ransika: Hello Ransika!
+[2026-10-07 13:07:22] User registered: Amal
+[2026-10-07 13:07:46] Private message: Ransika -> Devin: Hello Devin!
+[2026-10-07 13:08:38] Private message failed: Devin -> nobody

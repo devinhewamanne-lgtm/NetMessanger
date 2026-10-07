@@ -471,6 +471,97 @@ void broadcast_message(Client *sender, const char *message)
                   "OK SENT");
 }
 
+/* =========================================================
+   PRIVATE MESSAGE
+   Sends a message only to the specified user.
+   ========================================================= */
+
+void private_message(Client *sender,
+                     const char *target_username,
+                     const char *message)
+{
+    int target_fd = -1;
+
+    pthread_mutex_lock(&clients_mutex);
+
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].registered &&
+            strcmp(clients[i].username,
+                   target_username) == 0)
+        {
+            target_fd = clients[i].socket_fd;
+            break;
+        }
+    }
+
+    /*
+     * Target user does not exist.
+     */
+    if (target_fd == -1)
+    {
+        pthread_mutex_unlock(&clients_mutex);
+
+        send_response(sender->socket_fd,
+                      "ERR 002 USER_NOT_FOUND");
+
+        char log_message[BUFFER_SIZE];
+
+        snprintf(log_message,
+                 sizeof(log_message),
+                 "Private message failed: %s -> %s",
+                 sender->username,
+                 target_username);
+
+        log_event(log_message);
+
+        return;
+    }
+
+    /*
+     * Build the required message format.
+     */
+    char outgoing[BUFFER_SIZE];
+
+    snprintf(outgoing,
+             sizeof(outgoing),
+             "MSG PRIV %s %s\n",
+             sender->username,
+             message);
+
+    /*
+     * Send only to the target.
+     */
+    if (send_all(target_fd,
+                 outgoing,
+                 strlen(outgoing)) < 0)
+    {
+        perror("[SERVER] private message send");
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+
+    /*
+     * Confirm to sender.
+     */
+    send_response(sender->socket_fd,
+                  "OK SENT");
+
+    /*
+     * Log the event.
+     */
+    char log_message[BUFFER_SIZE];
+
+    snprintf(log_message,
+             sizeof(log_message),
+             "Private message: %s -> %s: %s",
+             sender->username,
+             target_username,
+             message);
+
+    log_event(log_message);
+}
+
 
 /* =========================================================
    CLIENT THREAD
@@ -597,6 +688,64 @@ void *handle_client(void *arg)
 
    			 continue;
 		}
+
+	/* =================================================
+   PMSG
+   ================================================= */
+
+if (strncmp(line, "PMSG ", 5) == 0)
+{
+    char *command_data = line + 5;
+
+    /*
+     * Find the space separating the username
+     * from the message.
+     */
+    char *separator = strchr(command_data, ' ');
+
+    if (separator == NULL ||
+        separator == command_data ||
+        *(separator + 1) == '\0')
+    {
+        send_response(client->socket_fd,
+                      "ERR 008 INVALID_COMMAND");
+
+        continue;
+    }
+
+    /*
+     * Extract target username.
+     */
+    size_t username_length =
+        (size_t)(separator - command_data);
+
+    if (username_length >= MAX_USERNAME)
+    {
+        send_response(client->socket_fd,
+                      "ERR 006 INVALID_USERNAME");
+
+        continue;
+    }
+
+    char target_username[MAX_USERNAME];
+
+    memcpy(target_username,
+           command_data,
+           username_length);
+
+    target_username[username_length] = '\0';
+
+    /*
+     * Everything after the separator is the message.
+     */
+    const char *message = separator + 1;
+
+    private_message(client,
+                    target_username,
+                    message);
+
+    continue;
+}
 
 
         /* =================================================
