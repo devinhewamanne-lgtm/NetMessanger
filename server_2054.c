@@ -2,15 +2,17 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 /* =========================================================
-   PERSONALIZED CONFIGURATION
+   PERSONALIZATION
    ========================================================= */
 
 #define REGISTRATION_NUMBER "IT23752054"
@@ -31,16 +33,16 @@
 #define MAX_ROOM_NAME 32
 
 #define BUFFER_SIZE 4096
+#define LIST_BUFFER_SIZE 640
 
 /*
- * Maximum practical size for a users/rooms list.
- * 20 clients x 31-character usernames + commas.
+ * Maximum accepted file size: 10 MiB
  */
-#define LIST_BUFFER_SIZE 1024
+#define MAX_FILE_SIZE (10ULL * 1024ULL * 1024ULL)
 
 
 /* =========================================================
-   CLIENT STRUCTURE
+   DATA STRUCTURES
    ========================================================= */
 
 typedef struct
@@ -52,15 +54,12 @@ typedef struct
 
     /*
      * joined_rooms[i] == 1
-     * means the client is a member of rooms[i].
+     * means this client belongs to rooms[i].
      */
     int joined_rooms[MAX_ROOMS];
 
     /*
-     * TCP line receive buffer.
-     * This allows us to correctly handle:
-     * - partial lines
-     * - multiple lines in one recv()
+     * TCP receive buffer.
      */
     char recv_buffer[BUFFER_SIZE];
     size_t recv_len;
@@ -68,14 +67,9 @@ typedef struct
 } Client;
 
 
-/* =========================================================
-   ROOM STRUCTURE
-   ========================================================= */
-
 typedef struct
 {
     int active;
-
     char name[MAX_ROOM_NAME];
 
 } Room;
@@ -88,7 +82,86 @@ typedef struct
 Client clients[MAX_CLIENTS];
 Room rooms[MAX_ROOMS];
 
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t clients_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
+
+/* =========================================================
+   FUNCTION PROTOTYPES
+   =========================================================
+   These declarations fix the previous:
+   "implicit declaration of function" errors.
+   ========================================================= */
+
+void log_event(const char *event);
+
+int send_all(int socket_fd,
+             const char *data,
+             size_t length);
+
+int send_response(int socket_fd,
+                  const char *response);
+
+int receive_line(Client *client,
+                 char *line,
+                 size_t line_size);
+
+int receive_exact(Client *client,
+                  unsigned char *data,
+                  size_t length);
+
+int discard_exact(Client *client,
+                  size_t length);
+
+int valid_username(const char *username);
+
+int valid_room_name(const char *room_name);
+
+Client *find_client_by_username(const char *username);
+
+int find_room_index(const char *room_name);
+
+int safe_filename(const char *filename,
+                  char *output,
+                  size_t output_size);
+
+int create_user_storage(const char *username,
+                        char *path,
+                        size_t path_size);
+
+void notify_presence(Client *client,
+                     const char *action);
+
+int register_user(Client *client,
+                  const char *username);
+
+void list_users(Client *client);
+
+void broadcast_message(Client *sender,
+                        const char *message);
+
+void private_message(Client *sender,
+                     const char *target_username,
+                     const char *message);
+
+void join_room(Client *client,
+               const char *room_name);
+
+void leave_room(Client *client,
+                const char *room_name);
+
+void list_rooms(Client *client);
+
+void room_message(Client *sender,
+                  const char *room_name,
+                  const char *message);
+
+int handle_sendfile(Client *sender,
+                    const char *command);
+
+void remove_client(Client *client);
+
+void *handle_client(void *arg);
 
 
 /* =========================================================
@@ -97,7 +170,8 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void log_event(const char *event)
 {
-    FILE *fp = fopen(LOG_FILE, "a");
+    FILE *fp =
+        fopen(LOG_FILE, "a");
 
     if (fp == NULL)
     {
@@ -105,9 +179,11 @@ void log_event(const char *event)
         return;
     }
 
-    time_t now = time(NULL);
+    time_t now =
+        time(NULL);
 
-    struct tm *tm_info = localtime(&now);
+    struct tm *tm_info =
+        localtime(&now);
 
     char timestamp[64];
 
@@ -136,7 +212,6 @@ void log_event(const char *event)
 
 /* =========================================================
    SEND ALL
-   TCP send() is not guaranteed to send everything.
    ========================================================= */
 
 int send_all(int socket_fd,
@@ -147,10 +222,11 @@ int send_all(int socket_fd,
 
     while (total_sent < length)
     {
-        ssize_t sent = send(socket_fd,
-                            data + total_sent,
-                            length - total_sent,
-                            0);
+        ssize_t sent =
+            send(socket_fd,
+                 data + total_sent,
+                 length - total_sent,
+                 0);
 
         if (sent < 0)
         {
@@ -167,7 +243,8 @@ int send_all(int socket_fd,
             return -1;
         }
 
-        total_sent += (size_t)sent;
+        total_sent +=
+            (size_t)sent;
     }
 
     return 0;
@@ -175,8 +252,7 @@ int send_all(int socket_fd,
 
 
 /* =========================================================
-   SEND PERSONALIZED SERVER RESPONSE
-   Every OK/ERR response gets NID:7520.
+   SEND SERVER RESPONSE
    ========================================================= */
 
 int send_response(int socket_fd,
@@ -184,11 +260,12 @@ int send_response(int socket_fd,
 {
     char line[BUFFER_SIZE];
 
-    int written = snprintf(line,
-                           sizeof(line),
-                           "%s %s\n",
-                           response,
-                           NID_TAG);
+    int written =
+        snprintf(line,
+                 sizeof(line),
+                 "%s %s\n",
+                 response,
+                 NID_TAG);
 
     if (written < 0 ||
         (size_t)written >= sizeof(line))
@@ -204,9 +281,6 @@ int send_response(int socket_fd,
 
 /* =========================================================
    RECEIVE ONE COMPLETE LINE
-   Handles:
-   - partial recv()
-   - multiple lines in one recv()
    ========================================================= */
 
 int receive_line(Client *client,
@@ -216,7 +290,7 @@ int receive_line(Client *client,
     while (1)
     {
         /*
-         * Search for '\n' already in the buffer.
+         * Search for newline already in buffer.
          */
         for (size_t i = 0;
              i < client->recv_len;
@@ -224,7 +298,8 @@ int receive_line(Client *client,
         {
             if (client->recv_buffer[i] == '\n')
             {
-                size_t line_length = i + 1;
+                size_t line_length =
+                    i + 1;
 
                 if (line_length >= line_size)
                 {
@@ -238,24 +313,26 @@ int receive_line(Client *client,
                 line[line_length] = '\0';
 
                 /*
-                 * Remove the processed line.
+                 * Remove processed line.
                  */
                 size_t remaining =
-                    client->recv_len - line_length;
+                    client->recv_len -
+                    line_length;
 
                 memmove(client->recv_buffer,
-                        client->recv_buffer + line_length,
+                        client->recv_buffer +
+                            line_length,
                         remaining);
 
-                client->recv_len = remaining;
+                client->recv_len =
+                    remaining;
 
                 return 1;
             }
         }
 
         /*
-         * No complete line yet.
-         * Make sure the buffer does not overflow.
+         * Protect receive buffer.
          */
         if (client->recv_len >=
             sizeof(client->recv_buffer) - 1)
@@ -263,18 +340,19 @@ int receive_line(Client *client,
             return -2;
         }
 
+        /*
+         * Receive more TCP bytes.
+         */
         ssize_t received =
             recv(client->socket_fd,
-                 client->recv_buffer + client->recv_len,
+                 client->recv_buffer +
+                     client->recv_len,
                  sizeof(client->recv_buffer) -
                      client->recv_len - 1,
                  0);
 
         if (received == 0)
         {
-            /*
-             * Graceful or ungraceful disconnect.
-             */
             return 0;
         }
 
@@ -288,15 +366,190 @@ int receive_line(Client *client,
             return -1;
         }
 
-        client->recv_len += (size_t)received;
+        client->recv_len +=
+            (size_t)received;
 
-        client->recv_buffer[client->recv_len] = '\0';
+        client->recv_buffer[
+            client->recv_len] = '\0';
     }
 }
 
 
 /* =========================================================
-   CHECK USERNAME
+   RECEIVE EXACTLY N BYTES
+   Used for file transfer.
+   ========================================================= */
+
+int receive_exact(Client *client,
+                  unsigned char *data,
+                  size_t length)
+{
+    size_t total_received = 0;
+
+    /*
+     * First consume bytes already buffered after
+     * the SENDFILE header.
+     */
+    while (total_received < length &&
+           client->recv_len > 0)
+    {
+        size_t available =
+            client->recv_len;
+
+        size_t needed =
+            length - total_received;
+
+        size_t to_copy =
+            available < needed
+                ? available
+                : needed;
+
+        memcpy(data + total_received,
+               client->recv_buffer,
+               to_copy);
+
+        total_received +=
+            to_copy;
+
+        size_t remaining =
+            client->recv_len -
+            to_copy;
+
+        memmove(client->recv_buffer,
+                client->recv_buffer +
+                    to_copy,
+                remaining);
+
+        client->recv_len =
+            remaining;
+    }
+
+    /*
+     * Receive remaining bytes directly
+     * from the TCP socket.
+     */
+    while (total_received < length)
+    {
+        ssize_t received =
+            recv(client->socket_fd,
+                 data + total_received,
+                 length - total_received,
+                 0);
+
+        if (received == 0)
+        {
+            return 0;
+        }
+
+        if (received < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
+        }
+
+        total_received +=
+            (size_t)received;
+    }
+
+    return 1;
+}
+
+
+/* =========================================================
+   DISCARD EXACTLY N BYTES
+   Used to keep TCP stream synchronized after a rejected
+   file transfer.
+   ========================================================= */
+
+int discard_exact(Client *client,
+                  size_t length)
+{
+    unsigned char temp[8192];
+
+    size_t total =
+        0;
+
+    /*
+     * Discard bytes already buffered.
+     */
+    while (total < length &&
+           client->recv_len > 0)
+    {
+        size_t available =
+            client->recv_len;
+
+        size_t needed =
+            length - total;
+
+        size_t to_consume =
+            available < needed
+                ? available
+                : needed;
+
+        size_t remaining =
+            client->recv_len -
+            to_consume;
+
+        memmove(client->recv_buffer,
+                client->recv_buffer +
+                    to_consume,
+                remaining);
+
+        client->recv_len =
+            remaining;
+
+        total +=
+            to_consume;
+    }
+
+    /*
+     * Discard remaining bytes from socket.
+     */
+    while (total < length)
+    {
+        size_t chunk =
+            length - total;
+
+        if (chunk > sizeof(temp))
+        {
+            chunk = sizeof(temp);
+        }
+
+        ssize_t received =
+            recv(client->socket_fd,
+                 temp,
+                 chunk,
+                 0);
+
+        if (received == 0)
+        {
+            return 0;
+        }
+
+        if (received < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
+        }
+
+        total +=
+            (size_t)received;
+    }
+
+    return 1;
+}
+
+
+/* =========================================================
+   USERNAME VALIDATION
    ========================================================= */
 
 int valid_username(const char *username)
@@ -306,7 +559,8 @@ int valid_username(const char *username)
         return 0;
     }
 
-    size_t length = strlen(username);
+    size_t length =
+        strlen(username);
 
     if (length == 0 ||
         length >= MAX_USERNAME)
@@ -314,7 +568,9 @@ int valid_username(const char *username)
         return 0;
     }
 
-    for (size_t i = 0; i < length; i++)
+    for (size_t i = 0;
+         i < length;
+         i++)
     {
         if (username[i] == ' ' ||
             username[i] == '\t' ||
@@ -330,7 +586,7 @@ int valid_username(const char *username)
 
 
 /* =========================================================
-   CHECK ROOM NAME
+   ROOM NAME VALIDATION
    ========================================================= */
 
 int valid_room_name(const char *room_name)
@@ -340,7 +596,8 @@ int valid_room_name(const char *room_name)
         return 0;
     }
 
-    size_t length = strlen(room_name);
+    size_t length =
+        strlen(room_name);
 
     if (length == 0 ||
         length >= MAX_ROOM_NAME)
@@ -348,7 +605,9 @@ int valid_room_name(const char *room_name)
         return 0;
     }
 
-    for (size_t i = 0; i < length; i++)
+    for (size_t i = 0;
+         i < length;
+         i++)
     {
         if (room_name[i] == ' ' ||
             room_name[i] == '\t' ||
@@ -365,7 +624,7 @@ int valid_room_name(const char *room_name)
 
 /* =========================================================
    FIND CLIENT BY USERNAME
-   Caller must hold clients_mutex.
+   Caller should hold clients_mutex.
    ========================================================= */
 
 Client *find_client_by_username(const char *username)
@@ -387,19 +646,138 @@ Client *find_client_by_username(const char *username)
 
 
 /* =========================================================
-   BROADCAST PRESENCE
+   FIND ROOM
+   Caller should hold clients_mutex.
    ========================================================= */
 
-void notify_presence(Client *joining_client,
+int find_room_index(const char *room_name)
+{
+    for (int i = 0;
+         i < MAX_ROOMS;
+         i++)
+    {
+        if (rooms[i].active &&
+            strcmp(rooms[i].name,
+                   room_name) == 0)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+
+/* =========================================================
+   SAFE FILENAME
+   ========================================================= */
+
+int safe_filename(const char *filename,
+                  char *output,
+                  size_t output_size)
+{
+    if (filename == NULL ||
+        output == NULL ||
+        output_size == 0)
+    {
+        return 0;
+    }
+
+    size_t length =
+        strlen(filename);
+
+    if (length == 0 ||
+        length >= output_size)
+    {
+        return 0;
+    }
+
+    /*
+     * Prevent path traversal.
+     */
+    if (strcmp(filename, ".") == 0 ||
+        strcmp(filename, "..") == 0)
+    {
+        return 0;
+    }
+
+    if (strchr(filename, '/') != NULL ||
+        strchr(filename, '\\') != NULL)
+    {
+        return 0;
+    }
+
+    if (strstr(filename, "..") != NULL)
+    {
+        return 0;
+    }
+
+    memcpy(output,
+           filename,
+           length + 1);
+
+    return 1;
+}
+
+
+/* =========================================================
+   CREATE USER STORAGE DIRECTORY
+   ========================================================= */
+
+int create_user_storage(const char *username,
+                        char *path,
+                        size_t path_size)
+{
+    int written =
+        snprintf(path,
+                 path_size,
+                 "%s/%s",
+                 STORAGE_ROOT,
+                 username);
+
+    if (written < 0 ||
+        (size_t)written >= path_size)
+    {
+        return 0;
+    }
+
+    /*
+     * Create root directory.
+     */
+    if (mkdir(STORAGE_ROOT, 0755) < 0 &&
+        errno != EEXIST)
+    {
+        return 0;
+    }
+
+    /*
+     * Create sender directory.
+     */
+    if (mkdir(path, 0755) < 0 &&
+        errno != EEXIST)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/* =========================================================
+   PRESENCE NOTIFICATION
+   ========================================================= */
+
+void notify_presence(Client *client,
                      const char *action)
 {
     char message[BUFFER_SIZE];
 
-    int written = snprintf(message,
-                            sizeof(message),
-                            "MSG BCAST SERVER %s %s\n",
-                            joining_client->username,
-                            action);
+    int written =
+        snprintf(message,
+                 sizeof(message),
+                 "MSG BCAST SERVER %s %s\n",
+                 client->username,
+                 action);
 
     if (written < 0 ||
         (size_t)written >= sizeof(message))
@@ -407,8 +785,8 @@ void notify_presence(Client *joining_client,
         return;
     }
 
-    int joining_fd =
-        joining_client->socket_fd;
+    int source_fd =
+        client->socket_fd;
 
     pthread_mutex_lock(&clients_mutex);
 
@@ -417,14 +795,11 @@ void notify_presence(Client *joining_client,
          i++)
     {
         if (clients[i].registered &&
-            clients[i].socket_fd != joining_fd)
+            clients[i].socket_fd != source_fd)
         {
-            if (send_all(clients[i].socket_fd,
-                         message,
-                         strlen(message)) < 0)
-            {
-                perror("[SERVER] presence send");
-            }
+            send_all(clients[i].socket_fd,
+                     message,
+                     (size_t)written);
         }
     }
 
@@ -434,7 +809,6 @@ void notify_presence(Client *joining_client,
 
 /* =========================================================
    REGISTER USER
-   REGISTER must be the first command.
    ========================================================= */
 
 int register_user(Client *client,
@@ -450,9 +824,6 @@ int register_user(Client *client,
 
     pthread_mutex_lock(&clients_mutex);
 
-    /*
-     * Check duplicate username.
-     */
     if (find_client_by_username(username) != NULL)
     {
         pthread_mutex_unlock(&clients_mutex);
@@ -463,22 +834,15 @@ int register_user(Client *client,
         return -1;
     }
 
-    /*
-     * Register this client.
-     */
-    strncpy(client->username,
-            username,
-            MAX_USERNAME - 1);
-
-    client->username[MAX_USERNAME - 1] = '\0';
+    snprintf(client->username,
+             sizeof(client->username),
+             "%s",
+             username);
 
     client->registered = 1;
 
     pthread_mutex_unlock(&clients_mutex);
 
-    /*
-     * Log registration.
-     */
     char log_message[BUFFER_SIZE];
 
     snprintf(log_message,
@@ -488,9 +852,6 @@ int register_user(Client *client,
 
     log_event(log_message);
 
-    /*
-     * Registration response.
-     */
     char response[BUFFER_SIZE];
 
     snprintf(response,
@@ -504,9 +865,6 @@ int register_user(Client *client,
         return -1;
     }
 
-    /*
-     * Notify all other connected clients.
-     */
     notify_presence(client,
                     "joined");
 
@@ -555,30 +913,24 @@ void list_users(Client *client)
 
     pthread_mutex_unlock(&clients_mutex);
 
-    char response[BUFFER_SIZE];
-
-    int written;
+    char response[BUFFER_SIZE + 32];
 
     if (users[0] == '\0')
     {
-        written = snprintf(response,
-                           sizeof(response),
-                           "OK USERS");
+        snprintf(response,
+                 sizeof(response),
+                 "OK USERS");
     }
     else
     {
-        written = snprintf(response,
-                           sizeof(response),
-                           "OK USERS %s",
-                           users);
+        snprintf(response,
+                 sizeof(response),
+                 "OK USERS %s",
+                 users);
     }
 
-    if (written > 0 &&
-        (size_t)written < sizeof(response))
-    {
-        send_response(client->socket_fd,
-                      response);
-    }
+    send_response(client->socket_fd,
+                  response);
 
     log_event("LIST command executed");
 }
@@ -592,7 +944,7 @@ void broadcast_message(Client *sender,
                         const char *message)
 {
     if (message == NULL ||
-        strlen(message) == 0)
+        *message == '\0')
     {
         send_response(sender->socket_fd,
                       "ERR 008 INVALID_COMMAND");
@@ -602,11 +954,12 @@ void broadcast_message(Client *sender,
 
     char outgoing[BUFFER_SIZE];
 
-    int written = snprintf(outgoing,
-                           sizeof(outgoing),
-                           "MSG BCAST %s %s\n",
-                           sender->username,
-                           message);
+    int written =
+        snprintf(outgoing,
+                 sizeof(outgoing),
+                 "MSG BCAST %s %s\n",
+                 sender->username,
+                 message);
 
     if (written < 0 ||
         (size_t)written >= sizeof(outgoing))
@@ -629,26 +982,17 @@ void broadcast_message(Client *sender,
         if (clients[i].registered &&
             clients[i].socket_fd != sender_fd)
         {
-            if (send_all(clients[i].socket_fd,
-                         outgoing,
-                         (size_t)written) < 0)
-            {
-                perror("[SERVER] broadcast send");
-            }
+            send_all(clients[i].socket_fd,
+                     outgoing,
+                     (size_t)written);
         }
     }
 
     pthread_mutex_unlock(&clients_mutex);
 
-    /*
-     * Confirm to sender.
-     */
     send_response(sender->socket_fd,
                   "OK SENT");
 
-    /*
-     * Log.
-     */
     char log_message[BUFFER_SIZE];
 
     snprintf(log_message,
@@ -671,7 +1015,7 @@ void private_message(Client *sender,
 {
     if (!valid_username(target_username) ||
         message == NULL ||
-        strlen(message) == 0)
+        *message == '\0')
     {
         send_response(sender->socket_fd,
                       "ERR 008 INVALID_COMMAND");
@@ -688,14 +1032,12 @@ void private_message(Client *sender,
 
     if (target != NULL)
     {
-        target_fd = target->socket_fd;
+        target_fd =
+            target->socket_fd;
     }
 
     pthread_mutex_unlock(&clients_mutex);
 
-    /*
-     * Target not found.
-     */
     if (target_fd == -1)
     {
         send_response(sender->socket_fd,
@@ -714,16 +1056,14 @@ void private_message(Client *sender,
         return;
     }
 
-    /*
-     * Build required private-message format.
-     */
     char outgoing[BUFFER_SIZE];
 
-    int written = snprintf(outgoing,
-                           sizeof(outgoing),
-                           "MSG PRIV %s %s\n",
-                           sender->username,
-                           message);
+    int written =
+        snprintf(outgoing,
+                 sizeof(outgoing),
+                 "MSG PRIV %s %s\n",
+                 sender->username,
+                 message);
 
     if (written < 0 ||
         (size_t)written >= sizeof(outgoing))
@@ -734,25 +1074,13 @@ void private_message(Client *sender,
         return;
     }
 
-    /*
-     * Send only to the target.
-     */
-    if (send_all(target_fd,
-                 outgoing,
-                 (size_t)written) < 0)
-    {
-        perror("[SERVER] private message send");
-    }
+    send_all(target_fd,
+             outgoing,
+             (size_t)written);
 
-    /*
-     * Confirm to sender.
-     */
     send_response(sender->socket_fd,
                   "OK SENT");
 
-    /*
-     * Log.
-     */
     char log_message[BUFFER_SIZE];
 
     snprintf(log_message,
@@ -768,7 +1096,6 @@ void private_message(Client *sender,
 
 /* =========================================================
    JOIN ROOM
-   Creates room if it does not exist.
    ========================================================= */
 
 void join_room(Client *client,
@@ -784,37 +1111,27 @@ void join_room(Client *client,
 
     pthread_mutex_lock(&clients_mutex);
 
-    int room_index = -1;
-    int free_index = -1;
+    int room_index =
+        find_room_index(room_name);
 
     /*
-     * Find existing room and first free room slot.
-     */
-    for (int i = 0;
-         i < MAX_ROOMS;
-         i++)
-    {
-        if (rooms[i].active)
-        {
-            if (strcmp(rooms[i].name,
-                       room_name) == 0)
-            {
-                room_index = i;
-                break;
-            }
-        }
-        else if (free_index == -1)
-        {
-            free_index = i;
-        }
-    }
-
-    /*
-     * Room does not exist.
-     * Create it.
+     * Create room if it does not exist.
      */
     if (room_index == -1)
     {
+        int free_index = -1;
+
+        for (int i = 0;
+             i < MAX_ROOMS;
+             i++)
+        {
+            if (!rooms[i].active)
+            {
+                free_index = i;
+                break;
+            }
+        }
+
         if (free_index == -1)
         {
             pthread_mutex_unlock(&clients_mutex);
@@ -825,28 +1142,23 @@ void join_room(Client *client,
             return;
         }
 
-        room_index = free_index;
+        room_index =
+            free_index;
 
-        rooms[room_index].active = 1;
+        rooms[room_index].active =
+            1;
 
-        strncpy(rooms[room_index].name,
-                room_name,
-                MAX_ROOM_NAME - 1);
-
-        rooms[room_index].name[MAX_ROOM_NAME - 1] =
-            '\0';
+        snprintf(rooms[room_index].name,
+                 sizeof(rooms[room_index].name),
+                 "%s",
+                 room_name);
     }
 
-    /*
-     * Add client to room.
-     */
-    client->joined_rooms[room_index] = 1;
+    client->joined_rooms[room_index] =
+        1;
 
     pthread_mutex_unlock(&clients_mutex);
 
-    /*
-     * Response.
-     */
     char response[BUFFER_SIZE];
 
     snprintf(response,
@@ -857,9 +1169,6 @@ void join_room(Client *client,
     send_response(client->socket_fd,
                   response);
 
-    /*
-     * Log.
-     */
     char log_message[BUFFER_SIZE];
 
     snprintf(log_message,
@@ -889,24 +1198,9 @@ void leave_room(Client *client,
 
     pthread_mutex_lock(&clients_mutex);
 
-    int room_index = -1;
+    int room_index =
+        find_room_index(room_name);
 
-    for (int i = 0;
-         i < MAX_ROOMS;
-         i++)
-    {
-        if (rooms[i].active &&
-            strcmp(rooms[i].name,
-                   room_name) == 0)
-        {
-            room_index = i;
-            break;
-        }
-    }
-
-    /*
-     * Room does not exist.
-     */
     if (room_index == -1)
     {
         pthread_mutex_unlock(&clients_mutex);
@@ -917,10 +1211,7 @@ void leave_room(Client *client,
         return;
     }
 
-    /*
-     * Client is not a member.
-     */
-    if (client->joined_rooms[room_index] == 0)
+    if (!client->joined_rooms[room_index])
     {
         pthread_mutex_unlock(&clients_mutex);
 
@@ -930,16 +1221,11 @@ void leave_room(Client *client,
         return;
     }
 
-    /*
-     * Remove membership.
-     */
-    client->joined_rooms[room_index] = 0;
+    client->joined_rooms[room_index] =
+        0;
 
     pthread_mutex_unlock(&clients_mutex);
 
-    /*
-     * Response.
-     */
     char response[BUFFER_SIZE];
 
     snprintf(response,
@@ -950,9 +1236,6 @@ void leave_room(Client *client,
     send_response(client->socket_fd,
                   response);
 
-    /*
-     * Log.
-     */
     char log_message[BUFFER_SIZE];
 
     snprintf(log_message,
@@ -1006,7 +1289,7 @@ void list_rooms(Client *client)
 
     pthread_mutex_unlock(&clients_mutex);
 
-    char response[BUFFER_SIZE];
+    char response[BUFFER_SIZE + 32];
 
     if (room_list[0] == '\0')
     {
@@ -1030,8 +1313,495 @@ void list_rooms(Client *client)
 
 
 /* =========================================================
+   ROOM MESSAGE
+   ========================================================= */
+
+void room_message(Client *sender,
+                  const char *room_name,
+                  const char *message)
+{
+    if (!valid_room_name(room_name) ||
+        message == NULL ||
+        *message == '\0')
+    {
+        send_response(sender->socket_fd,
+                      "ERR 008 INVALID_COMMAND");
+
+        return;
+    }
+
+    pthread_mutex_lock(&clients_mutex);
+
+    int room_index =
+        find_room_index(room_name);
+
+    if (room_index == -1)
+    {
+        pthread_mutex_unlock(&clients_mutex);
+
+        send_response(sender->socket_fd,
+                      "ERR 003 ROOM_NOT_FOUND");
+
+        return;
+    }
+
+    /*
+     * Sender must belong to the room.
+     */
+    if (!sender->joined_rooms[room_index])
+    {
+        pthread_mutex_unlock(&clients_mutex);
+
+        send_response(sender->socket_fd,
+                      "ERR 009 NOT_IN_ROOM");
+
+        return;
+    }
+
+    char outgoing[BUFFER_SIZE];
+
+    int written =
+        snprintf(outgoing,
+                 sizeof(outgoing),
+                 "MSG ROOM %s %s %s\n",
+                 room_name,
+                 sender->username,
+                 message);
+
+    if (written < 0 ||
+        (size_t)written >= sizeof(outgoing))
+    {
+        pthread_mutex_unlock(&clients_mutex);
+
+        send_response(sender->socket_fd,
+                      "ERR 008 INVALID_COMMAND");
+
+        return;
+    }
+
+    /*
+     * Send to all room members.
+     * Sender is included because sender is a member.
+     */
+    for (int i = 0;
+         i < MAX_CLIENTS;
+         i++)
+    {
+        if (clients[i].registered &&
+            clients[i].joined_rooms[room_index])
+        {
+            send_all(clients[i].socket_fd,
+                     outgoing,
+                     (size_t)written);
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+
+    send_response(sender->socket_fd,
+                  "OK SENT");
+
+    char log_message[BUFFER_SIZE];
+
+    snprintf(log_message,
+             sizeof(log_message),
+             "Room message: %s -> %s: %s",
+             sender->username,
+             room_name,
+             message);
+
+    log_event(log_message);
+}
+
+
+/* =========================================================
+   SENDFILE
+   ========================================================= */
+
+int handle_sendfile(Client *sender,
+                    const char *command)
+{
+    char target_name[MAX_USERNAME];
+
+    char filename[256];
+
+    unsigned long long filesize_ull;
+
+    int parsed =
+        sscanf(command,
+               "SENDFILE %31s %255s %llu",
+               target_name,
+               filename,
+               &filesize_ull);
+
+    if (parsed != 3)
+    {
+        send_response(sender->socket_fd,
+                      "ERR 008 INVALID_COMMAND");
+
+        return 0;
+    }
+
+    /*
+     * Check size first.
+     */
+    if (filesize_ull >
+        MAX_FILE_SIZE)
+    {
+        send_response(sender->socket_fd,
+                      "ERR 004 FILE_TOO_LARGE");
+
+        /*
+         * Close the connection because raw file bytes
+         * may still follow this header.
+         */
+        return -1;
+    }
+
+    /*
+     * Validate filename.
+     */
+    char safe_name[256];
+
+    if (!safe_filename(filename,
+                       safe_name,
+                       sizeof(safe_name)))
+    {
+        send_response(sender->socket_fd,
+                      "ERR 008 INVALID_FILENAME");
+
+        return -1;
+    }
+
+    size_t filesize =
+        (size_t)filesize_ull;
+
+    /*
+     * Determine the target.
+     */
+    int recipient_fds[MAX_CLIENTS];
+
+    int recipient_count = 0;
+
+    pthread_mutex_lock(&clients_mutex);
+
+    /*
+     * First try username.
+     */
+    Client *target_user =
+        find_client_by_username(target_name);
+
+    if (target_user != NULL)
+    {
+        recipient_fds[recipient_count++] =
+            target_user->socket_fd;
+    }
+    else
+    {
+        /*
+         * Otherwise try room.
+         */
+        int room_index =
+            find_room_index(target_name);
+
+        if (room_index == -1)
+        {
+            pthread_mutex_unlock(&clients_mutex);
+
+            /*
+             * Consume the raw file bytes so the TCP
+             * stream remains synchronized.
+             */
+            if (discard_exact(sender,
+                              filesize) != 1)
+            {
+                return -1;
+            }
+
+            send_response(sender->socket_fd,
+                          "ERR 002 USER_NOT_FOUND");
+
+            char log_message[BUFFER_SIZE];
+
+            snprintf(log_message,
+                     sizeof(log_message),
+                     "File target not found: %s",
+                     target_name);
+
+            log_event(log_message);
+
+            return 0;
+        }
+
+        /*
+         * Sender must belong to the room.
+         */
+        if (!sender->joined_rooms[room_index])
+        {
+            pthread_mutex_unlock(&clients_mutex);
+
+            if (discard_exact(sender,
+                              filesize) != 1)
+            {
+                return -1;
+            }
+
+            send_response(sender->socket_fd,
+                          "ERR 009 NOT_IN_ROOM");
+
+            return 0;
+        }
+
+        /*
+         * Collect room members.
+         */
+        for (int i = 0;
+             i < MAX_CLIENTS;
+             i++)
+        {
+            if (clients[i].registered &&
+                clients[i].joined_rooms[room_index])
+            {
+                recipient_fds[recipient_count++] =
+                    clients[i].socket_fd;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+
+
+    /* =====================================================
+       ALLOCATE FILE BUFFER
+       ===================================================== */
+
+    unsigned char *file_data =
+        malloc(filesize > 0 ? filesize : 1);
+
+    if (file_data == NULL)
+    {
+        /*
+         * Drain incoming file bytes.
+         */
+        if (discard_exact(sender,
+                          filesize) != 1)
+        {
+            return -1;
+        }
+
+        send_response(sender->socket_fd,
+                      "ERR 011 MEMORY_ERROR");
+
+        return 0;
+    }
+
+
+    /* =====================================================
+       RECEIVE EXACTLY FILESIZE BYTES
+       ===================================================== */
+
+    int receive_result =
+        receive_exact(sender,
+                      file_data,
+                      filesize);
+
+    if (receive_result != 1)
+    {
+        free(file_data);
+
+        char log_message[BUFFER_SIZE];
+
+        snprintf(log_message,
+                 sizeof(log_message),
+                 "Incomplete file transfer from %s",
+                 sender->username);
+
+        log_event(log_message);
+
+        return -1;
+    }
+
+
+    /* =====================================================
+       CREATE SENDER STORAGE
+       ===================================================== */
+
+    char storage_dir[512];
+
+    if (!create_user_storage(sender->username,
+                             storage_dir,
+                             sizeof(storage_dir)))
+    {
+        free(file_data);
+
+        send_response(sender->socket_fd,
+                      "ERR 011 STORAGE_ERROR");
+
+        return 0;
+    }
+
+
+    /* =====================================================
+       BUILD SERVER STORAGE PATH
+       ===================================================== */
+
+    char storage_path[768];
+
+    int path_written =
+        snprintf(storage_path,
+                 sizeof(storage_path),
+                 "%s/%s",
+                 storage_dir,
+                 safe_name);
+
+    if (path_written < 0 ||
+        (size_t)path_written >=
+            sizeof(storage_path))
+    {
+        free(file_data);
+
+        send_response(sender->socket_fd,
+                      "ERR 011 STORAGE_ERROR");
+
+        return 0;
+    }
+
+
+    /* =====================================================
+       SAVE SERVER COPY
+       ===================================================== */
+
+    FILE *fp =
+        fopen(storage_path, "wb");
+
+    if (fp == NULL)
+    {
+        free(file_data);
+
+        send_response(sender->socket_fd,
+                      "ERR 011 STORAGE_ERROR");
+
+        return 0;
+    }
+
+
+    if (filesize > 0)
+    {
+        size_t written_bytes =
+            fwrite(file_data,
+                   1,
+                   filesize,
+                   fp);
+
+        if (written_bytes != filesize)
+        {
+            fclose(fp);
+
+            free(file_data);
+
+            send_response(sender->socket_fd,
+                          "ERR 011 STORAGE_ERROR");
+
+            return 0;
+        }
+    }
+
+    fclose(fp);
+
+
+    /* =====================================================
+       BUILD FORWARD HEADER
+       ===================================================== */
+
+    char forward_header[BUFFER_SIZE];
+
+    int header_written =
+        snprintf(forward_header,
+                 sizeof(forward_header),
+                 "SENDFILE %s %s %llu\n",
+                 target_name,
+                 safe_name,
+                 filesize_ull);
+
+    if (header_written < 0 ||
+        (size_t)header_written >=
+            sizeof(forward_header))
+    {
+        free(file_data);
+
+        send_response(sender->socket_fd,
+                      "ERR 008 INVALID_COMMAND");
+
+        return 0;
+    }
+
+
+    /* =====================================================
+       FORWARD FILE
+       ===================================================== */
+
+    for (int i = 0;
+         i < recipient_count;
+         i++)
+    {
+        if (send_all(recipient_fds[i],
+                     forward_header,
+                     (size_t)header_written) < 0)
+        {
+            continue;
+        }
+
+        if (filesize > 0)
+        {
+            if (send_all(recipient_fds[i],
+                         (const char *)file_data,
+                         filesize) < 0)
+            {
+                continue;
+            }
+        }
+    }
+
+
+    /* =====================================================
+       LOG FILE TRANSFER
+       ===================================================== */
+
+    char log_message[BUFFER_SIZE];
+
+    snprintf(log_message,
+             sizeof(log_message),
+             "File transfer: %s -> %s: %s (%llu bytes)",
+             sender->username,
+             target_name,
+             safe_name,
+             filesize_ull);
+
+    log_event(log_message);
+
+
+    /* =====================================================
+       CONFIRM TO SENDER
+       ===================================================== */
+
+    char response[BUFFER_SIZE];
+
+    snprintf(response,
+             sizeof(response),
+             "OK FILE_RECEIVED %s",
+             safe_name);
+
+    send_response(sender->socket_fd,
+                  response);
+
+    free(file_data);
+
+    return 0;
+}
+
+
+/* =========================================================
    REMOVE CLIENT
-   Cleans user and room membership.
    ========================================================= */
 
 void remove_client(Client *client)
@@ -1046,48 +1816,55 @@ void remove_client(Client *client)
 
     pthread_mutex_lock(&clients_mutex);
 
-    was_registered = client->registered;
+    was_registered =
+        client->registered;
 
-    disconnected_fd = client->socket_fd;
+    disconnected_fd =
+        client->socket_fd;
 
     if (was_registered)
     {
-        strncpy(username,
-                client->username,
-                MAX_USERNAME - 1);
-
-        username[MAX_USERNAME - 1] = '\0';
+        snprintf(username,
+                 sizeof(username),
+                 "%s",
+                 client->username);
     }
 
     /*
-     * Remove all room memberships.
+     * Clear room memberships.
      */
     for (int i = 0;
          i < MAX_ROOMS;
          i++)
     {
-        client->joined_rooms[i] = 0;
+        client->joined_rooms[i] =
+            0;
     }
 
     client->registered = 0;
-    client->username[0] = '\0';
-    client->recv_len = 0;
+
+    client->username[0] =
+        '\0';
+
+    client->recv_len =
+        0;
 
     /*
-     * Mark slot as free.
+     * Mark slot free.
      */
-    client->socket_fd = -1;
+    client->socket_fd =
+        -1;
 
     pthread_mutex_unlock(&clients_mutex);
+
 
     if (!was_registered)
     {
         return;
     }
 
-    /*
-     * Log disconnection.
-     */
+
+    /* Log disconnection. */
     char log_message[BUFFER_SIZE];
 
     snprintf(log_message,
@@ -1097,9 +1874,8 @@ void remove_client(Client *client)
 
     log_event(log_message);
 
-    /*
-     * Notify remaining clients.
-     */
+
+    /* Notify remaining users. */
     char message[BUFFER_SIZE];
 
     int written =
@@ -1121,14 +1897,12 @@ void remove_client(Client *client)
          i++)
     {
         if (clients[i].registered &&
-            clients[i].socket_fd != disconnected_fd)
+            clients[i].socket_fd !=
+                disconnected_fd)
         {
-            if (send_all(clients[i].socket_fd,
-                         message,
-                         (size_t)written) < 0)
-            {
-                perror("[SERVER] leave notification");
-            }
+            send_all(clients[i].socket_fd,
+                     message,
+                     (size_t)written);
         }
     }
 
@@ -1148,27 +1922,18 @@ void *handle_client(void *arg)
     int client_fd =
         client->socket_fd;
 
-    char client_address[INET_ADDRSTRLEN];
+    char log_message[BUFFER_SIZE];
 
-    snprintf(client_address,
-             sizeof(client_address),
-             "unknown");
-
-    /*
-     * We don't have the sockaddr structure here,
-     * so socket number is sufficient for this log.
-     */
-    char connect_log[BUFFER_SIZE];
-
-    snprintf(connect_log,
-             sizeof(connect_log),
+    snprintf(log_message,
+             sizeof(log_message),
              "Client connected: socket=%d",
              client_fd);
 
-    log_event(connect_log);
+    log_event(log_message);
 
     printf("[SERVER] Client connected: socket=%d\n",
            client_fd);
+
 
     while (1)
     {
@@ -1179,9 +1944,11 @@ void *handle_client(void *arg)
                          line,
                          sizeof(line));
 
-        /*
-         * Client disconnected.
-         */
+
+        /* =================================================
+           DISCONNECT
+           ================================================= */
+
         if (result == 0)
         {
             printf("[SERVER] Client disconnected: socket=%d\n",
@@ -1190,18 +1957,22 @@ void *handle_client(void *arg)
             break;
         }
 
-        /*
-         * Receive error.
-         */
+
+        /* =================================================
+           RECEIVE ERROR
+           ================================================= */
+
         if (result == -1)
         {
             perror("[SERVER] recv");
             break;
         }
 
-        /*
-         * Line too long.
-         */
+
+        /* =================================================
+           LINE TOO LONG
+           ================================================= */
+
         if (result == -2)
         {
             send_response(client->socket_fd,
@@ -1210,11 +1981,13 @@ void *handle_client(void *arg)
             break;
         }
 
+
         /*
          * Remove CR/LF.
          */
         line[strcspn(line,
                      "\r\n")] = '\0';
+
 
         /*
          * Ignore empty lines.
@@ -1223,6 +1996,7 @@ void *handle_client(void *arg)
         {
             continue;
         }
+
 
         printf("[SERVER] socket=%d: %s\n",
                client_fd,
@@ -1239,11 +2013,8 @@ void *handle_client(void *arg)
                         "REGISTER ",
                         9) == 0)
             {
-                const char *username =
-                    line + 9;
-
                 if (register_user(client,
-                                  username) < 0)
+                                  line + 9) < 0)
                 {
                     break;
                 }
@@ -1274,64 +2045,49 @@ void *handle_client(void *arg)
 
 
         /* =================================================
-           LIST USERS
+           LIST
            ================================================= */
 
         if (strcmp(line,
                    "LIST") == 0)
         {
             list_users(client);
-
             continue;
         }
 
 
         /* =================================================
-           BROADCAST
+           BCAST
            ================================================= */
 
         if (strncmp(line,
                     "BCAST ",
                     6) == 0)
         {
-            const char *message =
-                line + 6;
-
-            if (strlen(message) == 0)
-            {
-                send_response(client->socket_fd,
-                              "ERR 008 INVALID_COMMAND");
-
-                continue;
-            }
-
             broadcast_message(client,
-                              message);
+                              line + 6);
 
             continue;
         }
 
 
         /* =================================================
-           PRIVATE MESSAGE
+           PMSG
            ================================================= */
 
         if (strncmp(line,
                     "PMSG ",
                     5) == 0)
         {
-            char *command_data =
+            char *data =
                 line + 5;
 
-            /*
-             * Find space between username and message.
-             */
             char *separator =
-                strchr(command_data,
+                strchr(data,
                        ' ');
 
             if (separator == NULL ||
-                separator == command_data ||
+                separator == data ||
                 *(separator + 1) == '\0')
             {
                 send_response(client->socket_fd,
@@ -1340,14 +2096,10 @@ void *handle_client(void *arg)
                 continue;
             }
 
-            /*
-             * Determine username length.
-             */
-            size_t username_length =
-                (size_t)(separator -
-                         command_data);
+            size_t target_length =
+                (size_t)(separator - data);
 
-            if (username_length >=
+            if (target_length >=
                 MAX_USERNAME)
             {
                 send_response(client->socket_fd,
@@ -1356,70 +2108,139 @@ void *handle_client(void *arg)
                 continue;
             }
 
-            char target_username[MAX_USERNAME];
+            char target[MAX_USERNAME];
 
-            memcpy(target_username,
-                   command_data,
-                   username_length);
+            memcpy(target,
+                   data,
+                   target_length);
 
-            target_username[username_length] =
+            target[target_length] =
                 '\0';
 
-            const char *message =
-                separator + 1;
-
             private_message(client,
-                            target_username,
-                            message);
+                            target,
+                            separator + 1);
 
             continue;
         }
 
 
         /* =================================================
-           JOIN ROOM
+           JOIN
            ================================================= */
 
         if (strncmp(line,
                     "JOIN ",
                     5) == 0)
         {
-            const char *room_name =
-                line + 5;
-
             join_room(client,
-                      room_name);
+                      line + 5);
 
             continue;
         }
 
 
         /* =================================================
-           LEAVE ROOM
+           LEAVE
            ================================================= */
 
         if (strncmp(line,
                     "LEAVE ",
                     6) == 0)
         {
-            const char *room_name =
-                line + 6;
-
             leave_room(client,
-                       room_name);
+                       line + 6);
 
             continue;
         }
 
 
         /* =================================================
-           LIST ROOMS
+           ROOMS
            ================================================= */
 
         if (strcmp(line,
                    "ROOMS") == 0)
         {
             list_rooms(client);
+
+            continue;
+        }
+
+
+        /* =================================================
+           RMSG
+           ================================================= */
+
+        if (strncmp(line,
+                    "RMSG ",
+                    5) == 0)
+        {
+            char *data =
+                line + 5;
+
+            char *separator =
+                strchr(data,
+                       ' ');
+
+            if (separator == NULL ||
+                separator == data ||
+                *(separator + 1) == '\0')
+            {
+                send_response(client->socket_fd,
+                              "ERR 008 INVALID_COMMAND");
+
+                continue;
+            }
+
+            size_t room_length =
+                (size_t)(separator - data);
+
+            if (room_length >=
+                MAX_ROOM_NAME)
+            {
+                send_response(client->socket_fd,
+                              "ERR 008 INVALID_COMMAND");
+
+                continue;
+            }
+
+            char room_name[MAX_ROOM_NAME];
+
+            memcpy(room_name,
+                   data,
+                   room_length);
+
+            room_name[room_length] =
+                '\0';
+
+            room_message(client,
+                         room_name,
+                         separator + 1);
+
+            continue;
+        }
+
+
+        /* =================================================
+           SENDFILE
+           ================================================= */
+
+        if (strncmp(line,
+                    "SENDFILE ",
+                    9) == 0)
+        {
+            int transfer_result =
+                handle_sendfile(client,
+                                line);
+
+            /*
+             * -1 means connection should be closed.
+             */
+            if (transfer_result < 0)
+            {
+                break;
+            }
 
             continue;
         }
@@ -1435,7 +2256,8 @@ void *handle_client(void *arg)
             send_response(client->socket_fd,
                           "OK BYE");
 
-            log_event("Client requested QUIT");
+            log_event(
+                "Client requested QUIT");
 
             break;
         }
@@ -1450,18 +2272,15 @@ void *handle_client(void *arg)
     }
 
 
-    /*
-     * Save descriptor before remove_client()
-     * sets socket_fd = -1.
-     */
+    /* =====================================================
+       CLEANUP
+       ===================================================== */
+
     int close_fd =
         client->socket_fd;
 
     remove_client(client);
 
-    /*
-     * Close the real socket.
-     */
     if (close_fd >= 0)
     {
         close(close_fd);
@@ -1472,14 +2291,17 @@ void *handle_client(void *arg)
 
 
 /* =========================================================
-   MAIN SERVER
+   MAIN
    ========================================================= */
 
 int main(void)
 {
-    int server_fd;
-
-    struct sockaddr_in server_addr;
+    /*
+     * Prevent the server from terminating if it sends
+     * to a socket that has already been closed.
+     */
+    signal(SIGPIPE,
+           SIG_IGN);
 
 
     /* =====================================================
@@ -1490,16 +2312,24 @@ int main(void)
          i < MAX_CLIENTS;
          i++)
     {
-        clients[i].socket_fd = -1;
-        clients[i].registered = 0;
-        clients[i].username[0] = '\0';
-        clients[i].recv_len = 0;
+        clients[i].socket_fd =
+            -1;
+
+        clients[i].registered =
+            0;
+
+        clients[i].username[0] =
+            '\0';
+
+        clients[i].recv_len =
+            0;
 
         for (int j = 0;
              j < MAX_ROOMS;
              j++)
         {
-            clients[i].joined_rooms[j] = 0;
+            clients[i].joined_rooms[j] =
+                0;
         }
     }
 
@@ -1512,16 +2342,19 @@ int main(void)
          i < MAX_ROOMS;
          i++)
     {
-        rooms[i].active = 0;
-        rooms[i].name[0] = '\0';
+        rooms[i].active =
+            0;
+
+        rooms[i].name[0] =
+            '\0';
     }
 
 
     /* =====================================================
-       CREATE TCP SOCKET
+       CREATE SOCKET
        ===================================================== */
 
-    server_fd =
+    int server_fd =
         socket(AF_INET,
                SOCK_STREAM,
                0);
@@ -1529,12 +2362,12 @@ int main(void)
     if (server_fd < 0)
     {
         perror("socket");
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
 
     /* =====================================================
-       ALLOW QUICK RESTART
+       SO_REUSEADDR
        ===================================================== */
 
     int opt = 1;
@@ -1549,13 +2382,15 @@ int main(void)
 
         close(server_fd);
 
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
 
     /* =====================================================
        SERVER ADDRESS
        ===================================================== */
+
+    struct sockaddr_in server_addr;
 
     memset(&server_addr,
            0,
@@ -1565,7 +2400,7 @@ int main(void)
         AF_INET;
 
     server_addr.sin_addr.s_addr =
-        INADDR_ANY;
+        htonl(INADDR_ANY);
 
     server_addr.sin_port =
         htons(PORT);
@@ -1583,7 +2418,7 @@ int main(void)
 
         close(server_fd);
 
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
 
@@ -1598,12 +2433,12 @@ int main(void)
 
         close(server_fd);
 
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
 
     /* =====================================================
-       SERVER START MESSAGE
+       STARTUP INFORMATION
        ===================================================== */
 
     printf("========================================\n");
@@ -1619,11 +2454,15 @@ int main(void)
            LOG_FILE);
     printf("Storage      : %s\n",
            STORAGE_ROOT);
+    printf("Max file     : %llu bytes\n",
+           (unsigned long long)
+               MAX_FILE_SIZE);
     printf("========================================\n");
     printf("[SERVER] Listening for connections...\n");
 
 
-    log_event("NetMessenger server started");
+    log_event(
+        "NetMessenger server started");
 
 
     /* =====================================================
@@ -1640,9 +2479,6 @@ int main(void)
 
         /*
          * Find a free client slot.
-         *
-         * Only the main accept thread modifies the
-         * socket assignment, so this is safe here.
          */
         pthread_mutex_lock(&clients_mutex);
 
@@ -1663,33 +2499,7 @@ int main(void)
 
 
         /*
-         * Server full.
-         */
-        if (client == NULL)
-        {
-            int temp_fd =
-                accept(server_fd,
-                       (struct sockaddr *)&client_addr,
-                       &client_len);
-
-            if (temp_fd >= 0)
-            {
-                const char *full_message =
-                    "ERR 010 SERVER_FULL NID:7520\n";
-
-                send_all(temp_fd,
-                         full_message,
-                         strlen(full_message));
-
-                close(temp_fd);
-            }
-
-            continue;
-        }
-
-
-        /*
-         * Accept new TCP connection.
+         * Accept incoming connection.
          */
         int accepted_fd =
             accept(server_fd,
@@ -1698,37 +2508,67 @@ int main(void)
 
         if (accepted_fd < 0)
         {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
             perror("accept");
             continue;
         }
 
 
         /*
-         * Initialize the selected client slot.
+         * Server full.
          */
+        if (client == NULL)
+        {
+            const char *full_message =
+                "ERR 010 SERVER_FULL NID:7520\n";
+
+            send_all(accepted_fd,
+                     full_message,
+                     strlen(full_message));
+
+            close(accepted_fd);
+
+            continue;
+        }
+
+
+        /* =================================================
+           INITIALIZE CLIENT SLOT
+           ================================================= */
+
         pthread_mutex_lock(&clients_mutex);
 
-        client->socket_fd = accepted_fd;
+        client->socket_fd =
+            accepted_fd;
 
-        client->registered = 0;
+        client->registered =
+            0;
 
-        client->username[0] = '\0';
+        client->username[0] =
+            '\0';
 
-        client->recv_len = 0;
+        client->recv_len =
+            0;
 
         for (int j = 0;
              j < MAX_ROOMS;
              j++)
         {
-            client->joined_rooms[j] = 0;
+            client->joined_rooms[j] =
+                0;
         }
 
         pthread_mutex_unlock(&clients_mutex);
 
 
-        /*
-         * Create client thread.
-         */
+        /* =================================================
+           CREATE THREAD
+           ================================================= */
+
         pthread_t thread_id;
 
         if (pthread_create(&thread_id,
@@ -1740,16 +2580,24 @@ int main(void)
 
             pthread_mutex_lock(&clients_mutex);
 
-            client->socket_fd = -1;
-            client->registered = 0;
-            client->username[0] = '\0';
-            client->recv_len = 0;
+            client->socket_fd =
+                -1;
+
+            client->registered =
+                0;
+
+            client->username[0] =
+                '\0';
+
+            client->recv_len =
+                0;
 
             for (int j = 0;
                  j < MAX_ROOMS;
                  j++)
             {
-                client->joined_rooms[j] = 0;
+                client->joined_rooms[j] =
+                    0;
             }
 
             pthread_mutex_unlock(&clients_mutex);
@@ -1759,10 +2607,6 @@ int main(void)
             continue;
         }
 
-        /*
-         * We don't need to join the thread because
-         * each client thread cleans itself up.
-         */
         pthread_detach(thread_id);
     }
 
