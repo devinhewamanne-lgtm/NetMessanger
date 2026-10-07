@@ -442,11 +442,16 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+	printf("\nAvailable commands:\n");
+printf("LIST\n");
+printf("BCAST <message>\n");
+printf("PMSG <username> <message>\n");
+printf("JOIN <room>\n");
+printf("LEAVE <room>\n");
+printf("ROOMS\n");
+printf("QUIT\n");
+printf("\n");
 
-    printf("\nAvailable commands:\n");
-    printf("LIST\n");
-    printf("QUIT\n");
-    printf("\n");
 
 
     /* =====================================================

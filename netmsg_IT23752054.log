@@ -24,3 +24,13 @@
 [2026-10-07 13:07:22] User registered: Amal
 [2026-10-07 13:07:46] Private message: Ransika -> Devin: Hello Devin!
 [2026-10-07 13:08:38] Private message failed: Devin -> nobody
+[2026-10-07 14:15:34] NetMessenger server started
+[2026-10-07 14:15:50] Client connected: socket=4
+[2026-10-07 14:15:53] User registered: Devin
+[2026-10-07 14:16:09] User Devin joined room General
+[2026-10-07 14:16:49] User Devin joined room Network
+[2026-10-07 14:17:13] Client connected: socket=5
+[2026-10-07 14:17:17] User registered: Ransika
+[2026-10-07 14:17:32] User Ransika joined room General
+[2026-10-07 14:18:16] User Ransika left room General
+[2026-10-07 14:18:33] User Devin left room Network
