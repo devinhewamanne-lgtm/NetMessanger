@@ -34,3 +34,58 @@
 [2026-10-07 14:17:32] User Ransika joined room General
 [2026-10-07 14:18:16] User Ransika left room General
 [2026-10-07 14:18:33] User Devin left room Network
+[2026-10-07 14:52:02] NetMessenger server started
+[2026-10-07 14:52:10] Client connected: socket=4
+[2026-10-07 14:52:13] User registered: Devin
+[2026-10-07 14:52:51] User Devin joined room General
+[2026-10-07 14:53:15] Client connected: socket=5
+[2026-10-07 14:53:18] User registered: Ransika
+[2026-10-07 14:53:26] User Ransika joined room General
+[2026-10-07 14:55:36] User disconnected: Devin
+[2026-10-07 14:55:38] Client connected: socket=6
+[2026-10-07 14:55:41] User registered: Devin
+[2026-10-07 14:55:48] User Devin joined room General
+[2026-10-07 15:02:14] User disconnected: Devin
+[2026-10-07 16:23:49] NetMessenger server started
+[2026-10-07 16:24:02] Client connected: socket=4
+[2026-10-07 16:24:10] User registered: Devin
+[2026-10-07 16:24:22] LIST command executed
+[2026-10-07 16:24:42] Client connected: socket=5
+[2026-10-07 16:24:46] User registered: Ransika
+[2026-10-07 16:25:04] LIST command executed
+[2026-10-07 16:25:25] Broadcast from Devin: Hello Ransika!
+[2026-10-07 16:26:22] Private message: Devin -> Ransika: Private Hello!
+[2026-10-07 16:26:58] User Devin joined room General
+[2026-10-07 16:27:12] User Devin joined room Rooms
+[2026-10-07 16:27:34] User Devin left room General
+[2026-10-07 16:27:44] User Devin left room Rooms
+[2026-10-07 16:28:21] Client requested QUIT
+[2026-10-07 16:28:21] User disconnected: Ransika
+[2026-10-07 16:28:38] User disconnected: Devin
+[2026-10-07 19:47:42] NetMessenger server started
+[2026-10-07 19:47:51] Client connected: socket=4
+[2026-10-07 19:47:54] User registered: Devin
+[2026-10-07 19:48:39] Client connected: socket=5
+[2026-10-07 19:48:42] User registered: Ransika
+[2026-10-07 19:49:08] Broadcast from Devin: hello!
+[2026-10-07 19:49:31] Private message: Devin -> Ransika: Hello!
+[2026-10-07 19:49:41] User Devin joined room General
+[2026-10-07 21:52:50] NetMessenger server started
+[2026-10-07 21:53:59] Client connected: socket=4
+[2026-10-07 21:54:03] User registered: Devin
+[2026-10-07 21:54:08] Client connected: socket=5
+[2026-10-07 21:54:11] User registered: Ransika
+[2026-10-07 21:54:40] File transfer: Devin -> Ransika: test.txt (32 bytes)
+[2026-10-07 22:04:09] User disconnected: Ransika
+[2026-10-07 22:23:26] NetMessenger server started
+[2026-10-07 22:24:01] NetMessenger server started
+[2026-10-07 22:24:24] Client connected: socket=4
+[2026-10-07 22:24:27] User registered: Devin
+[2026-10-07 22:24:31] Client connected: socket=5
+[2026-10-07 22:24:35] User registered: Ransika
+[2026-10-07 22:24:50] Client connected: socket=6
+[2026-10-07 22:24:57] User registered: Amal
+[2026-10-07 22:25:09] Client connected: socket=7
+[2026-10-07 22:25:15] User registered: Kamal
+[2026-10-07 22:25:26] Client connected: socket=8
+[2026-10-07 22:25:31] User registered: TestUser
